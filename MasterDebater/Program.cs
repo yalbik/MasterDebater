@@ -21,6 +21,8 @@ class Program
     private const int MaxRounds = 20;
     private const int DefaultContextWindow = 32768;
     private const string ConsensusMarker = "[CONSENSUS]";
+    private const string ImpasseMarker = "[IMPASSE]";
+    private const int MinRoundsForImpasse = 3;
     private static readonly object ConsoleLock = new();
 
     static async Task Main(string[] args)
@@ -148,7 +150,11 @@ class Program
         string lastResponseB = string.Empty;
         bool consensusA = false;
         bool consensusB = false;
+        bool impasseA = false;
+        bool impasseB = false;
         bool reachedConsensus = false;
+        bool reachedImpasse = false;
+        bool reconciliationAttempted = false;
 
         try
         {
@@ -162,6 +168,74 @@ class Program
             name1, ConsoleColor.Blue);
 
         consensusA = ContainsConsensus(lastResponseA);
+        impasseA = ContainsImpasse(lastResponseA);
+
+        // Local function: checks for consensus (with verification) or impasse (with reconciliation).
+        // Returns true if the debate should end.
+        async Task<bool> TryResolveDebate(int currentRound)
+        {
+            // ── Consensus verification ──────────────────────────────
+            if (consensusA && consensusB)
+            {
+                var posA = ExtractMarkerStatement(lastResponseA, ConsensusMarker);
+                var posB = ExtractMarkerStatement(lastResponseB, ConsensusMarker);
+                var (verified, newA, newB) = await VerifyConsensusAsync(
+                    chatA, name1, posA, chatB, name2, posB);
+                if (verified)
+                {
+                    reachedConsensus = true;
+                    PrintConsensusReached();
+                    return true;
+                }
+                PrintFalseConsensusDetected();
+                lastResponseA = newA; lastResponseB = newB;
+                consensusA = false; consensusB = false;
+                impasseA = false; impasseB = false;
+                return false;
+            }
+
+            // ── Impasse reconciliation ──────────────────────────────
+            if (impasseA && impasseB)
+            {
+                if (currentRound < MinRoundsForImpasse)
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.WriteLine($"  [Impasse signals ignored -- minimum {MinRoundsForImpasse} rounds required before impasse can be declared]");
+                    Console.ResetColor();
+                    impasseA = false; impasseB = false;
+                    return false;
+                }
+
+                // If reconciliation was already attempted once, accept the impasse immediately
+                if (reconciliationAttempted)
+                {
+                    reachedImpasse = true;
+                    PrintImpasseReached();
+                    return true;
+                }
+
+                reconciliationAttempted = true;
+                var (still, newA, newB) = await AttemptReconciliationAsync(
+                    chatA, name1, chatB, name2, topic);
+                if (still)
+                {
+                    reachedImpasse = true;
+                    PrintImpasseReached();
+                    lastResponseA = newA; lastResponseB = newB;
+                    return true;
+                }
+                // At least one debater found room for compromise
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine("  [Reconciliation: at least one debater found room for compromise. Debate continues.]");
+                Console.ResetColor();
+                lastResponseA = newA; lastResponseB = newB;
+                consensusA = ContainsConsensus(newA); consensusB = ContainsConsensus(newB);
+                impasseA = false; impasseB = false;
+                return false;
+            }
+
+            return false;
+        }
 
         for (int round = 1; round <= MaxRounds; round++)
         {
@@ -175,13 +249,9 @@ class Program
             PrintHistoryDepth(chatA, name1, chatB, name2);
             lastResponseB = await StreamResponse(chatB, promptB, name2, ConsoleColor.Magenta);
             consensusB = ContainsConsensus(lastResponseB);
+            impasseB = ContainsImpasse(lastResponseB);
 
-            if (consensusA && consensusB)
-            {
-                reachedConsensus = true;
-                PrintConsensusReached();
-                break;
-            }
+            if (await TryResolveDebate(round)) break;
 
             // ── Debater A responds ─────────────────────────────────────
             WriteRoundHeader($"ROUND {round} -- {name1} responds");
@@ -191,51 +261,69 @@ class Program
             PrintHistoryDepth(chatA, name1, chatB, name2);
             lastResponseA = await StreamResponse(chatA, promptA, name1, ConsoleColor.Blue);
             consensusA = ContainsConsensus(lastResponseA);
+            impasseA = ContainsImpasse(lastResponseA);
 
-            if (consensusA && consensusB)
-            {
-                reachedConsensus = true;
-                PrintConsensusReached();
-                break;
-            }
+            if (await TryResolveDebate(round)) break;
 
             if (round == MaxRounds)
             {
                 Console.WriteLine();
                 Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine($"  WARNING: Maximum rounds ({MaxRounds}) reached without full mutual consensus.");
+                Console.WriteLine($"  WARNING: Maximum rounds ({MaxRounds}) reached without consensus or impasse.");
                 Console.ResetColor();
             }
         }
 
-        // ── Generate summary ───────────────────────────────────────────
+        // ── Generate summaries from both models ───────────────────────
         Console.WriteLine();
         WriteDivider('=');
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("  GENERATING DEBATE SUMMARY ...");
+        Console.WriteLine("  GENERATING DEBATE SUMMARIES ...");
         Console.ResetColor();
         WriteDivider('-');
         Console.WriteLine();
 
-        var summaryClient = new OllamaApiClient(uri);
-        summaryClient.SelectedModel = model1;
-        var summaryChat = new Chat(summaryClient, "You are an impartial debate analyst. Provide clear, concise summaries.")
+        string outcomeDescription;
+        if (reachedConsensus)
+            outcomeDescription = "Both debaters reached consensus on this topic.";
+        else if (reachedImpasse)
+            outcomeDescription = "Both debaters declared an impasse -- a fundamental, irreconcilable disagreement.";
+        else
+            outcomeDescription = $"The debate ended after reaching the maximum of {MaxRounds} rounds without consensus or impasse.";
+
+        // ── Summary from Debater A ─────────────────────────────────
+        var summaryPromptA = $"The debate on \"{topic}\" has concluded. {outcomeDescription}\n\n"
+            + "Write a single concise paragraph summarizing YOUR final position on this topic. "
+            + "Explain what you believe, what key arguments support your view, and where you stand relative to your opponent. "
+            + $"Do NOT include any {ConsensusMarker} or {ImpasseMarker} markers in your summary.";
+
+        Console.ForegroundColor = ConsoleColor.Blue;
+        Console.WriteLine($"  === {name1}'s Summary ===");
+        Console.ResetColor();
+        Console.WriteLine();
+
+        Console.ForegroundColor = ConsoleColor.Blue;
+        await foreach (var token in chatA.SendAsync(summaryPromptA))
         {
-            Options = contextOptions
-        };
+            Console.Write(token);
+        }
+        Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine();
 
-        var consensusInstruction = reachedConsensus
-            ? "Both debaters reached consensus. Please summarize the agreed-upon conclusion clearly and concisely. Highlight the key points both sides came to agree on."
-            : "The debaters did not fully reach consensus within the allotted rounds. Please summarize the current state of the discussion: what they agree on, what they still disagree on, and what the most likely resolution would be.";
+        // ── Summary from Debater B ─────────────────────────────────
+        var summaryPromptB = $"The debate on \"{topic}\" has concluded. {outcomeDescription}\n\n"
+            + "Write a single concise paragraph summarizing YOUR final position on this topic. "
+            + "Explain what you believe, what key arguments support your view, and where you stand relative to your opponent. "
+            + $"Do NOT include any {ConsensusMarker} or {ImpasseMarker} markers in your summary.";
 
-        var summaryPrompt = $"A debate was held on the following topic:\n\"{topic}\"\n\n"
-            + $"The final position from {name1} ({model1}):\n\"\"\"\n{lastResponseA}\n\"\"\"\n\n"
-            + $"The final position from {name2} ({model2}):\n\"\"\"\n{lastResponseB}\n\"\"\"\n\n"
-            + consensusInstruction + "\n\n"
-            + "Do NOT include any [CONSENSUS] tags in your summary.\nFormat your summary with clear sections.";
+        Console.ForegroundColor = ConsoleColor.Magenta;
+        Console.WriteLine($"  === {name2}'s Summary ===");
+        Console.ResetColor();
+        Console.WriteLine();
 
-        Console.ForegroundColor = ConsoleColor.White;
-        await foreach (var token in summaryChat.SendAsync(summaryPrompt))
+        Console.ForegroundColor = ConsoleColor.Magenta;
+        await foreach (var token in chatB.SendAsync(summaryPromptB))
         {
             Console.Write(token);
         }
@@ -245,9 +333,12 @@ class Program
         WriteDivider('=');
 
         Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine(reachedConsensus
-            ? "  Debate concluded with consensus."
-            : "  Debate concluded (max rounds reached).");
+        if (reachedConsensus)
+            Console.WriteLine("  Debate concluded with consensus.");
+        else if (reachedImpasse)
+            Console.WriteLine("  Debate concluded with impasse.");
+        else
+            Console.WriteLine("  Debate concluded (max rounds reached).");
         Console.ResetColor();
         Console.WriteLine("  Thank you for using MasterDebater!");
         WriteDivider('=');
@@ -309,15 +400,44 @@ class Program
 
                 {ConsensusMarker}
 
-            After the marker, write a one-paragraph summary of the agreed-upon position.
-            Do NOT use {ConsensusMarker} prematurely or just to end the debate early.
-            Both debaters must independently include {ConsensusMarker} for the debate to conclude.
+            After the marker, write a one-paragraph summary of the SPECIFIC position you both agree on.
+            Be precise -- state the actual agreed conclusion, not just that you "found common ground."
+
+            CRITICAL: Consensus means you BOTH hold the SAME position on the core question.
+            If you believe X and {opponentName} believes Y, that is NOT consensus, even if you
+            respect each other's arguments or agree on secondary points.
+            Do NOT use {ConsensusMarker} just to be agreeable, to be polite, or to end the debate.
+
+            VERIFICATION: After both debaters claim consensus, a verification round will occur.
+            You will be shown {opponentName}'s stated consensus position and asked to confirm or
+            reject it. If the positions do not genuinely match, the false consensus will be
+            detected and the debate will continue.
+
+            === IMPASSE PROTOCOL ===
+            If -- and ONLY if -- after at least {MinRoundsForImpasse} rounds of genuine debate, you believe
+            the disagreement is truly fundamental and irreconcilable (e.g., based on different
+            core values, axioms, or definitions that neither side can concede), you may end
+            your response with the exact marker:
+
+                {ImpasseMarker}
+
+            After the marker, briefly explain WHY you believe the disagreement cannot be resolved.
+
+            RESTRICTIONS ON IMPASSE:
+            - Impasse CANNOT be declared before round {MinRoundsForImpasse}.
+            - You must have made genuine, creative attempts to find common ground first.
+            - Impasse is an absolute LAST RESORT, not an easy exit.
+            - When both debaters declare impasse, a mandatory RECONCILIATION ROUND will require
+              one final attempt to find any common ground before impasse is accepted.
+            - Prefer consensus over impasse whenever ANY overlap in positions is possible.
 
             === IMPORTANT ===
             - Be respectful but intellectually rigorous.
             - Avoid repeating points already conceded.
             - Focus on substance, not rhetoric.
-            - The debate ends only when BOTH you and {opponentName} include {ConsensusMarker} in your latest responses.
+            - The debate ends when BOTH debaters include {ConsensusMarker} (verified agreement) or BOTH include {ImpasseMarker} (confirmed impasse after reconciliation).
+            - You may only use ONE marker per response: either {ConsensusMarker} or {ImpasseMarker}, never both.
+            - Remember: consensus verification WILL catch false agreement. Be honest about your actual position.
             """;
     }
 
@@ -422,12 +542,97 @@ class Program
     }
 
     // ════════════════════════════════════════════════════════════════════
-    //  Consensus Detection
+    //  Consensus & Impasse Detection
     // ════════════════════════════════════════════════════════════════════
 
     static bool ContainsConsensus(string response)
     {
         return response.Contains(ConsensusMarker, StringComparison.OrdinalIgnoreCase);
+    }
+
+    static bool ContainsImpasse(string response)
+    {
+        return response.Contains(ImpasseMarker, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Extracts the text that follows a marker (e.g. [CONSENSUS]) in a response.
+    /// </summary>
+    static string ExtractMarkerStatement(string response, string marker)
+    {
+        var idx = response.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return string.Empty;
+        return response[(idx + marker.Length)..].Trim();
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  Consensus Verification
+    // ════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Cross-examines each debater by showing them the OTHER model's stated consensus.
+    /// Both must [CONFIRM] for the consensus to be accepted.
+    /// </summary>
+    static async Task<(bool Verified, string ResponseA, string ResponseB)> VerifyConsensusAsync(
+        Chat chatA, string nameA, string positionA,
+        Chat chatB, string nameB, string positionB)
+    {
+        PrintVerifyingConsensus();
+
+        // Ask A to verify B's stated consensus
+        WriteRoundHeader($"VERIFICATION -- {nameA}");
+        var verifyPromptA = $"CONSENSUS VERIFICATION: {nameB} stated the agreed consensus position as:\n\"\"\"\n{positionB}\n\"\"\"\n\n"
+            + $"Does this accurately represent YOUR understanding of what was agreed upon?\n"
+            + $"If YES -- you genuinely hold this same position -- respond with [CONFIRM] followed by a brief restatement in your own words.\n"
+            + $"If NO -- this does NOT match your actual position -- respond with [REJECT] and clearly state what you ACTUALLY believe.";
+        var verifyA = await StreamResponse(chatA, verifyPromptA, nameA, ConsoleColor.Blue);
+
+        // Ask B to verify A's stated consensus
+        WriteRoundHeader($"VERIFICATION -- {nameB}");
+        var verifyPromptB = $"CONSENSUS VERIFICATION: {nameA} stated the agreed consensus position as:\n\"\"\"\n{positionA}\n\"\"\"\n\n"
+            + $"Does this accurately represent YOUR understanding of what was agreed upon?\n"
+            + $"If YES -- you genuinely hold this same position -- respond with [CONFIRM] followed by a brief restatement in your own words.\n"
+            + $"If NO -- this does NOT match your actual position -- respond with [REJECT] and clearly state what you ACTUALLY believe.";
+        var verifyB = await StreamResponse(chatB, verifyPromptB, nameB, ConsoleColor.Magenta);
+
+        bool confirmA = verifyA.Contains("[CONFIRM]", StringComparison.OrdinalIgnoreCase);
+        bool confirmB = verifyB.Contains("[CONFIRM]", StringComparison.OrdinalIgnoreCase);
+
+        return (confirmA && confirmB, verifyA, verifyB);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  Impasse Reconciliation
+    // ════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Forces one final attempt at finding common ground before accepting impasse.
+    /// Both models must STILL include [IMPASSE] for the impasse to hold.
+    /// </summary>
+    static async Task<(bool StillImpasse, string ResponseA, string ResponseB)> AttemptReconciliationAsync(
+        Chat chatA, string nameA,
+        Chat chatB, string nameB,
+        string topic)
+    {
+        PrintReconciliationAttempt();
+
+        var reconPrompt = $"Both debaters have declared an impasse on \"{topic}\". "
+            + "Before this is accepted, you are REQUIRED to make one final, genuine attempt at finding common ground.\n\n"
+            + "Focus specifically on:\n"
+            + "1. What specific points DO you both agree on?\n"
+            + "2. Is there a narrower or qualified version of the position you could both accept?\n"
+            + "3. Can you propose a concrete compromise that addresses both sides' core concerns?\n\n"
+            + $"If after this genuine attempt you STILL believe the disagreement is truly irreconcilable, "
+            + $"include {ImpasseMarker} in your response and explain precisely why no compromise is possible.\n"
+            + $"Otherwise, present your compromise proposal WITHOUT any {ImpasseMarker} or {ConsensusMarker} markers.";
+
+        WriteRoundHeader($"RECONCILIATION -- {nameA}");
+        var reconA = await StreamResponse(chatA, reconPrompt, nameA, ConsoleColor.Blue);
+
+        WriteRoundHeader($"RECONCILIATION -- {nameB}");
+        var reconB = await StreamResponse(chatB, reconPrompt, nameB, ConsoleColor.Magenta);
+
+        return (ContainsImpasse(reconA) && ContainsImpasse(reconB), reconA, reconB);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -543,6 +748,50 @@ class Program
         Console.WriteLine("  +===================================================+");
         Console.WriteLine("  |        *** CONSENSUS REACHED ***                   |");
         Console.WriteLine("  |     Both debaters have agreed on a position!       |");
+        Console.WriteLine("  +===================================================+");
+        Console.ResetColor();
+    }
+
+    static void PrintImpasseReached()
+    {
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine("  +===================================================+");
+        Console.WriteLine("  |        *** IMPASSE DECLARED ***                    |");
+        Console.WriteLine("  |   Both debaters agree they cannot find agreement.  |");
+        Console.WriteLine("  +===================================================+");
+        Console.ResetColor();
+    }
+
+    static void PrintVerifyingConsensus()
+    {
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("  +===================================================+");
+        Console.WriteLine("  |      VERIFYING CONSENSUS ...                       |");
+        Console.WriteLine("  |   Cross-examining each debater's stated position   |");
+        Console.WriteLine("  +===================================================+");
+        Console.ResetColor();
+    }
+
+    static void PrintFalseConsensusDetected()
+    {
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine("  +===================================================+");
+        Console.WriteLine("  |      FALSE CONSENSUS DETECTED                      |");
+        Console.WriteLine("  |   Debaters do not actually agree -- continuing     |");
+        Console.WriteLine("  +===================================================+");
+        Console.ResetColor();
+    }
+
+    static void PrintReconciliationAttempt()
+    {
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("  +===================================================+");
+        Console.WriteLine("  |      RECONCILIATION ATTEMPT                        |");
+        Console.WriteLine("  |   Requiring one final attempt at common ground     |");
         Console.WriteLine("  +===================================================+");
         Console.ResetColor();
     }
