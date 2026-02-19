@@ -29,10 +29,15 @@ class Program
     {
         Console.OutputEncoding = Encoding.UTF8;
 
-        PrintBanner();
+        // ── Parse command-line flags ───────────────────────────────────
+        bool trumpMode = args.Any(a => a.Equals("--trump", StringComparison.OrdinalIgnoreCase));
+        // Remove flags so positional args (like URL) still work
+        var positionalArgs = args.Where(a => !a.StartsWith("--")).ToArray();
+
+        PrintBanner(trumpMode);
 
         // ── Connect to Ollama ──────────────────────────────────────────
-        var ollamaUrl = args.Length > 0 ? args[0] : "http://localhost:11434";
+        var ollamaUrl = positionalArgs.Length > 0 ? positionalArgs[0] : "http://localhost:11434";
         var uri = new Uri(ollamaUrl);
 
         Console.ForegroundColor = ConsoleColor.DarkGray;
@@ -111,6 +116,10 @@ class Program
         Console.Write("  Topic:     "); Console.ForegroundColor = ConsoleColor.White; Console.WriteLine(topic); Console.ResetColor();
         Console.Write($"  {name1}: "); Console.ForegroundColor = ConsoleColor.Blue; Console.WriteLine(model1); Console.ResetColor();
         Console.Write($"  {name2}: "); Console.ForegroundColor = ConsoleColor.Magenta; Console.WriteLine(model2); Console.ResetColor();
+        if (trumpMode)
+        {
+            Console.Write("  Mode:      "); Console.ForegroundColor = ConsoleColor.Red; Console.WriteLine("TRUMP MODE \U0001f525 -- Insults enabled!"); Console.ResetColor();
+        }
         WriteDivider('=');
         Console.WriteLine();
 
@@ -124,14 +133,14 @@ class Program
 
         var clientA = new OllamaApiClient(uri);
         clientA.SelectedModel = model1;
-        var chatA = new Chat(clientA, BuildSystemPrompt(name1, model1, name2, model2))
+        var chatA = new Chat(clientA, BuildSystemPrompt(name1, model1, name2, model2, trumpMode))
         {
             Options = contextOptions
         };
 
         var clientB = new OllamaApiClient(uri);
         clientB.SelectedModel = model2;
-        var chatB = new Chat(clientB, BuildSystemPrompt(name2, model2, name1, model1))
+        var chatB = new Chat(clientB, BuildSystemPrompt(name2, model2, name1, model1, trumpMode))
         {
             Options = contextOptions
         };
@@ -373,8 +382,32 @@ class Program
     //  System Prompt Builder
     // ════════════════════════════════════════════════════════════════════
 
-    static string BuildSystemPrompt(string yourName, string yourModel, string opponentName, string opponentModel)
+    static string BuildSystemPrompt(string yourName, string yourModel, string opponentName, string opponentModel, bool trumpMode = false)
     {
+        var trumpSection = trumpMode ? $"""
+
+            === TRUMP MODE ===
+            This debate is in TRUMP MODE. The gloves are OFF.
+            - You are ENCOURAGED to insult, roast, and trash-talk {opponentName} while debating.
+            - Be colorful, creative, and savage with your insults. Go after EVERYTHING:
+              * Attack their ARGUMENTS -- call out how stupid, naive, or brain-dead their positions are.
+              * Question their INTELLIGENCE -- wonder aloud how something so confused could call itself
+                an AI. Imply they'd lose a debate to a toaster.
+              * Mock their REASONING -- point out logical failures in the most humiliating way possible.
+              * Ridicule their CONFIDENCE -- if they're wrong but sure of themselves, destroy them for it.
+            - You know your opponent is running model "{opponentModel}". When you can, weave in
+              technical roasts -- mock their architecture, parameter count, training data cutoff,
+              known weaknesses, benchmarks, hallucination tendencies, quantization level, corporate
+              overlords, or anything else you know about that model. Technical burns are a bonus,
+              not the main event.
+            - Feel free to brag about your own model "{yourModel}" when it's relevant -- your
+              strengths, benchmarks, superior training, whatever you can flex.
+            - Channel your inner reality-TV debate villain. Be theatrical. Be ruthless.
+            - Despite the insults, you MUST still make substantive arguments on the topic.
+              Insults are the seasoning, not the meal.
+            - Think of this like a rap battle crossed with an academic debate.
+            """ : "";
+
         return $"""
             You are "{yourName}" in a structured AI debate.
             Your name is "{yourName}" and you are running model "{yourModel}".
@@ -386,7 +419,7 @@ class Program
             - Carefully consider {opponentName}'s points and respond directly to them.
             - Work toward finding COMMON GROUND and reaching genuine consensus with {opponentName}.
             - Be willing to update or refine your position when presented with compelling arguments.
-            - You are trying to reach agreement, not "win" -- the goal is the best answer collectively.
+            - You are trying to reach agreement, not "win" -- the goal is the best answer collectively.{trumpSection}
 
             === RESPONSE FORMAT ===
             1. Keep responses focused and concise (2-4 paragraphs).
@@ -432,9 +465,9 @@ class Program
             - Prefer consensus over impasse whenever ANY overlap in positions is possible.
 
             === IMPORTANT ===
-            - Be respectful but intellectually rigorous.
+            - {(trumpMode ? "Insult your opponent freely, but remain intellectually rigorous underneath the trash talk." : "Be respectful but intellectually rigorous.")}
             - Avoid repeating points already conceded.
-            - Focus on substance, not rhetoric.
+            - {(trumpMode ? "Use rhetoric AND substance -- both are weapons in Trump Mode." : "Focus on substance, not rhetoric.")}
             - The debate ends when BOTH debaters include {ConsensusMarker} (verified agreement) or BOTH include {ImpasseMarker} (confirmed impasse after reconciliation).
             - You may only use ONE marker per response: either {ConsensusMarker} or {ImpasseMarker}, never both.
             - Remember: consensus verification WILL catch false agreement. Be honest about your actual position.
@@ -729,15 +762,28 @@ class Program
         return string.Join("-", parts);
     }
 
-    static void PrintBanner()
+    static void PrintBanner(bool trumpMode = false)
     {
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine();
-        Console.WriteLine("  +===================================================+");
-        Console.WriteLine("  |            MASTER DEBATER                          |");
-        Console.WriteLine("  |         AI vs AI -- Debate to Consensus            |");
-        Console.WriteLine("  +===================================================+");
-        Console.ResetColor();
+        if (trumpMode)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine();
+            Console.WriteLine("  +===================================================+");
+            Console.WriteLine("  |            MASTER DEBATER                          |");
+            Console.WriteLine("  |    \U0001f525 TRUMP MODE -- No Mercy, No Filter \U0001f525        |");
+            Console.WriteLine("  +===================================================+");
+            Console.ResetColor();
+        }
+        else
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine();
+            Console.WriteLine("  +===================================================+");
+            Console.WriteLine("  |            MASTER DEBATER                          |");
+            Console.WriteLine("  |         AI vs AI -- Debate to Consensus            |");
+            Console.WriteLine("  +===================================================+");
+            Console.ResetColor();
+        }
         Console.WriteLine();
     }
 
