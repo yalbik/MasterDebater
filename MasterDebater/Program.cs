@@ -1,4 +1,5 @@
 ﻿using System.Text;
+using System.Text.Json;
 using OllamaSharp;
 using OllamaSharp.Models;
 using OllamaSharp.Models.Chat;
@@ -24,6 +25,44 @@ class Program
     private const string ImpasseMarker = "[IMPASSE]";
     private const int MinRoundsForImpasse = 3;
     private static readonly object ConsoleLock = new();
+    private static readonly string StateFilePath = Path.Combine(
+        ".", "state.json");
+
+    // ════════════════════════════════════════════════════════════════════
+    //  Persisted State
+    // ════════════════════════════════════════════════════════════════════
+
+    class AppState
+    {
+        public string? LastModel1 { get; set; }
+        public string? LastModel2 { get; set; }
+    }
+
+    static AppState LoadState()
+    {
+        try
+        {
+            if (File.Exists(StateFilePath))
+            {
+                var json = File.ReadAllText(StateFilePath);
+                return JsonSerializer.Deserialize<AppState>(json) ?? new AppState();
+            }
+        }
+        catch { /* corrupt state file -- ignore */ }
+        return new AppState();
+    }
+
+    static void SaveState(AppState state)
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(StateFilePath)!;
+            Directory.CreateDirectory(dir);
+            var json = JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(StateFilePath, json);
+        }
+        catch { /* non-critical -- ignore */ }
+    }
 
     static async Task Main(string[] args)
     {
@@ -69,19 +108,6 @@ class Program
             return;
         }
 
-        Console.WriteLine();
-        Console.ForegroundColor = ConsoleColor.White;
-        Console.WriteLine("Installed Ollama models:");
-        Console.ResetColor();
-        for (int i = 0; i < models.Count; i++)
-        {
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.Write($"  [{i + 1}]  ");
-            Console.ResetColor();
-            Console.WriteLine(models[i].Name);
-        }
-        Console.WriteLine();
-
         // ── Get debate topic ───────────────────────────────────────────
         Console.ForegroundColor = ConsoleColor.Yellow;
         Console.Write("Enter the debate topic: ");
@@ -95,8 +121,25 @@ class Program
         Console.WriteLine();
 
         // ── Select two models ──────────────────────────────────────────
-        var model1 = PromptModelSelection(models, "Select Debater 1");
-        var model2 = PromptModelSelection(models, "Select Debater 2");
+        var state = LoadState();
+
+        Console.ForegroundColor = ConsoleColor.White;
+        Console.WriteLine("Installed Ollama models:");
+        Console.ResetColor();
+        for (int i = 0; i < models.Count; i++)
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.Write($"  [{i + 1}]  ");
+            Console.ResetColor();
+            Console.WriteLine(models[i].Name);
+        }
+        Console.WriteLine();
+
+        var model1 = PromptModelSelection(models, "Select Debater 1", state.LastModel1);
+        var model2 = PromptModelSelection(models, "Select Debater 2", state.LastModel2);
+
+        // Persist selections for next run
+        SaveState(new AppState { LastModel1 = model1, LastModel2 = model2 });
 
         // Derive friendly debater names from model names
         var name1 = GetDebaterName(model1);
@@ -714,15 +757,44 @@ class Program
         Console.ResetColor();
     }
 
-    static string PromptModelSelection(IList<OllamaSharp.Models.Model> models, string label)
+    static string PromptModelSelection(IList<OllamaSharp.Models.Model> models, string label, string? defaultModel = null)
     {
+        // Resolve default index (1-based) if the saved model still exists
+        int? defaultIndex = null;
+        if (!string.IsNullOrEmpty(defaultModel))
+        {
+            for (int i = 0; i < models.Count; i++)
+            {
+                if (string.Equals(models[i].Name, defaultModel, StringComparison.OrdinalIgnoreCase))
+                {
+                    defaultIndex = i + 1;
+                    break;
+                }
+            }
+        }
+
         while (true)
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.Write($"{label} [1-{models.Count}]: ");
+            if (defaultIndex.HasValue)
+                Console.Write($"{label} [1-{models.Count}] (default: {defaultIndex} = {defaultModel}): ");
+            else
+                Console.Write($"{label} [1-{models.Count}]: ");
             Console.ResetColor();
 
-            if (int.TryParse(Console.ReadLine()?.Trim(), out int choice)
+            var input = Console.ReadLine()?.Trim();
+
+            // Accept default on empty input
+            if (string.IsNullOrEmpty(input) && defaultIndex.HasValue)
+            {
+                var selected = models[defaultIndex.Value - 1].Name;
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"  -> {selected}");
+                Console.ResetColor();
+                return selected;
+            }
+
+            if (int.TryParse(input, out int choice)
                 && choice >= 1 && choice <= models.Count)
             {
                 var selected = models[choice - 1].Name;
