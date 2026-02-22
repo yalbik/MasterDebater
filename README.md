@@ -1,10 +1,10 @@
 # MasterDebater
 
-AI vs AI debate engine powered by [Ollama](https://ollama.com). Pick two local LLMs, give them a topic, and watch them argue it out until they reach consensus -- or declare an impasse.
+AI vs AI debate engine. Pick two LLMs, give them a topic, and watch them argue it out until they reach consensus -- or declare an impasse. Supports [Ollama](https://ollama.com) as well as any OpenAI-compatible server (LM Studio, vLLM, llama.cpp, OpenAI, etc.).
 
 ## Features
 
-- **Structured debate** between any two Ollama models running locally
+- **Structured debate** between any two models -- via Ollama or any OpenAI-compatible server
 - **Consensus protocol** -- models work toward genuine agreement with cross-verification to prevent false consensus
 - **Impasse protocol** -- when agreement is impossible, models can declare an impasse (with a mandatory reconciliation attempt first)
 - **Trump mode** -- enables insults, trash talk, and no-holds-barred rhetorical combat between models
@@ -16,8 +16,8 @@ AI vs AI debate engine powered by [Ollama](https://ollama.com). Pick two local L
 ## Requirements
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download) (or later)
-- [Ollama](https://ollama.com) running locally (or on an accessible host)
-- At least 2 models pulled in Ollama (e.g. `ollama pull llama3.2`, `ollama pull qwen3`)
+- **Ollama mode:** [Ollama](https://ollama.com) running locally or on an accessible host, with at least 2 models pulled (e.g. `ollama pull llama3.2`, `ollama pull qwen3`)
+- **OpenAI mode:** any OpenAI-compatible server (LM Studio, vLLM, llama.cpp, OpenAI API, etc.) or a real OpenAI API key
 
 ## Build
 
@@ -30,41 +30,52 @@ dotnet build
 ## Usage
 
 ```
-dotnet run --project MasterDebater [ollama-url] [--trump]
+dotnet run --project MasterDebater [url] [--openai] [--api-key <key>] [--trump]
 ```
 
 ### Arguments
 
 | Argument | Description | Default |
 |---|---|---|
-| `ollama-url` | URL of the Ollama API | `http://localhost:11434` |
+| `url` | Backend URL | `http://localhost:11434` |
+| `--openai` | Use OpenAI-compatible API instead of Ollama | off |
+| `--api-key <key>` | API key for OpenAI-compatible servers that require one | `ollama` |
 | `--trump` | Enable Trump mode (insults and trash talk between models) | off |
 
-### Examples
+### Ollama mode
 
-Run with default settings (Ollama on localhost):
+Ollama mode is the default. No extra flags needed.
 
 ```
+# Local Ollama (default)
 dotnet run --project MasterDebater
-```
 
-Connect to a remote Ollama instance:
-
-```
+# Remote Ollama
 dotnet run --project MasterDebater http://192.168.1.50:11434
-```
 
-Enable Trump mode:
-
-```
+# Local Ollama + Trump mode
 dotnet run --project MasterDebater --trump
 ```
 
-Both options together:
+### OpenAI-compatible mode
+
+Pass `--openai` to switch to the OpenAI-compatible API. The URL should point to the base of the API (including `/v1` if required by the server).
 
 ```
-dotnet run --project MasterDebater http://192.168.1.50:11434 --trump
+# LM Studio (default port)
+dotnet run --project MasterDebater http://localhost:1234/v1 --openai
+
+# vLLM or llama.cpp server
+dotnet run --project MasterDebater http://localhost:8000/v1 --openai
+
+# Real OpenAI API
+dotnet run --project MasterDebater https://api.openai.com --openai --api-key sk-...
+
+# OpenAI-compatible server + Trump mode
+dotnet run --project MasterDebater http://localhost:1234/v1 --openai --trump
 ```
+
+> **API key:** local servers (LM Studio, vLLM, llama.cpp) don't require a real key -- any non-empty string works and `ollama` is used by default. Only pass `--api-key` when connecting to a service that requires authentication.
 
 ### Interactive prompts
 
@@ -93,7 +104,7 @@ Key constants in `Program.cs`:
 | Constant | Value | Description |
 |---|---|---|
 | `MaxRounds` | 20 | Maximum debate rounds before forced termination |
-| `DefaultContextWindow` | 32768 | Token context window passed to each model |
+| `DefaultContextWindow` | 32768 | Token context window passed to each model (Ollama mode only) |
 | `MinRoundsForImpasse` | 3 | Minimum rounds before impasse can be declared |
 
 ## License

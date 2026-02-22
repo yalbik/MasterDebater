@@ -1,5 +1,9 @@
-﻿using System.Text;
+using System.Text;
 using System.Text.Json;
+using System.ClientModel;
+using OpenAI;
+using OpenAI.Chat;
+using OpenAI.Models;
 using OllamaSharp;
 using OllamaSharp.Models;
 using OllamaSharp.Models.Chat;
@@ -14,6 +18,61 @@ class ContextWindowExceededException : Exception
         : base(message, innerException)
     {
         ModelName = modelName;
+    }
+}
+
+interface IDebateChat
+{
+    event EventHandler<string> OnThink;  // no-op for OpenAI path
+    int MessageCount { get; }
+    IAsyncEnumerable<string> SendAsync(string message);
+}
+
+class OllamaDebateChat : IDebateChat
+{
+    private readonly Chat _chat;
+    public OllamaDebateChat(Chat chat) => _chat = chat;
+
+    public event EventHandler<string> OnThink
+    {
+        add    => _chat.OnThink += value;
+        remove => _chat.OnThink -= value;
+    }
+    public int MessageCount => _chat.Messages.Count;
+    public IAsyncEnumerable<string> SendAsync(string message) => _chat.SendAsync(message);
+}
+
+class OpenAIDebateChat : IDebateChat
+{
+    private readonly ChatClient _client;
+    private readonly List<ChatMessage> _messages = new();
+
+    public OpenAIDebateChat(ChatClient client, string systemPrompt)
+    {
+        _client = client;
+        _messages.Add(new SystemChatMessage(systemPrompt));
+    }
+
+    public event EventHandler<string> OnThink { add { } remove { } }  // no-op
+    public int MessageCount => _messages.Count;
+
+    public async IAsyncEnumerable<string> SendAsync(string message)
+    {
+        _messages.Add(new UserChatMessage(message));
+        var sb = new StringBuilder();
+
+        await foreach (var update in _client.CompleteChatStreamingAsync(_messages))
+        {
+            foreach (var part in update.ContentUpdate)
+            {
+                if (!string.IsNullOrEmpty(part.Text))
+                {
+                    sb.Append(part.Text);
+                    yield return part.Text;
+                }
+            }
+        }
+        _messages.Add(new AssistantChatMessage(sb.ToString()));
     }
 }
 
@@ -69,42 +128,70 @@ class Program
         Console.OutputEncoding = Encoding.UTF8;
 
         // ── Parse command-line flags ───────────────────────────────────
-        bool trumpMode = args.Any(a => a.Equals("--trump", StringComparison.OrdinalIgnoreCase));
-        // Remove flags so positional args (like URL) still work
-        var positionalArgs = args.Where(a => !a.StartsWith("--")).ToArray();
+        bool trumpMode  = args.Any(a => a.Equals("--trump",  StringComparison.OrdinalIgnoreCase));
+        bool openAiMode = args.Any(a => a.Equals("--openai", StringComparison.OrdinalIgnoreCase));
+
+        string apiKey = "ollama";
+        for (int i = 0; i < args.Length - 1; i++)
+            if (args[i].Equals("--api-key", StringComparison.OrdinalIgnoreCase))
+                { apiKey = args[i + 1]; break; }
+
+        bool skipNext = false;
+        var positionalArgs = args.Where((a, _) =>
+        {
+            if (skipNext) { skipNext = false; return false; }
+            if (a.Equals("--api-key", StringComparison.OrdinalIgnoreCase)) { skipNext = true; return false; }
+            return !a.StartsWith("--");
+        }).ToArray();
 
         PrintBanner(trumpMode);
 
-        // ── Connect to Ollama ──────────────────────────────────────────
+        // ── Connect to backend ─────────────────────────────────────────
         var ollamaUrl = positionalArgs.Length > 0 ? positionalArgs[0] : "http://localhost:11434";
         var uri = new Uri(ollamaUrl);
 
         Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine($"Connecting to Ollama at {ollamaUrl} ...");
+        Console.WriteLine($"Connecting to {(openAiMode ? "OpenAI-compatible endpoint" : "Ollama")} at {ollamaUrl} ...");
         Console.ResetColor();
 
-        OllamaApiClient probe;
-        try
+        List<string> modelNames;
+
+        if (openAiMode)
         {
-            probe = new OllamaApiClient(uri);
-            _ = await probe.ListLocalModelsAsync(); // quick connectivity test
+            try
+            {
+                var probe = new OpenAIClient(new ApiKeyCredential(apiKey),
+                                new OpenAIClientOptions { Endpoint = uri });
+                var result = await probe.GetOpenAIModelClient().GetModelsAsync();
+                modelNames = result.Value.Select(m => m.Id).OrderBy(id => id).ToList();
+            }
+            catch (Exception ex)
+            {
+                WriteError($"Could not connect to OpenAI-compatible endpoint at {ollamaUrl}: {ex.Message}");
+                return;
+            }
         }
-        catch (Exception ex)
+        else
         {
-            WriteError($"Could not connect to Ollama at {ollamaUrl}: {ex.Message}");
-            WriteError("Make sure Ollama is running (ollama serve).");
-            return;
+            OllamaApiClient probe;
+            try
+            {
+                probe = new OllamaApiClient(uri);
+                _ = await probe.ListLocalModelsAsync(); // quick connectivity test
+            }
+            catch (Exception ex)
+            {
+                WriteError($"Could not connect to Ollama at {ollamaUrl}: {ex.Message}");
+                WriteError("Make sure Ollama is running (ollama serve).");
+                return;
+            }
+            modelNames = (await probe.ListLocalModelsAsync()).Select(m => m.Name).OrderBy(n => n).ToList();
         }
 
-        // ── List installed models ──────────────────────────────────────
-        var models = (await probe.ListLocalModelsAsync())
-            .OrderBy(m => m.Name)
-            .ToList();
-
-        if (models.Count < 2)
+        if (modelNames.Count < 2)
         {
-            WriteError("At least 2 Ollama models must be installed to run a debate.");
-            WriteError("Install more models with: ollama pull <model-name>");
+            WriteError("At least 2 models must be available to run a debate.");
+            if (!openAiMode) WriteError("Install more models with: ollama pull <model-name>");
             return;
         }
 
@@ -124,19 +211,19 @@ class Program
         var state = LoadState();
 
         Console.ForegroundColor = ConsoleColor.White;
-        Console.WriteLine("Installed Ollama models:");
+        Console.WriteLine("Available models:");
         Console.ResetColor();
-        for (int i = 0; i < models.Count; i++)
+        for (int i = 0; i < modelNames.Count; i++)
         {
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.Write($"  [{i + 1}]  ");
             Console.ResetColor();
-            Console.WriteLine(models[i].Name);
+            Console.WriteLine(modelNames[i]);
         }
         Console.WriteLine();
 
-        var model1 = PromptModelSelection(models, "Select Debater 1", state.LastModel1);
-        var model2 = PromptModelSelection(models, "Select Debater 2", state.LastModel2);
+        var model1 = PromptModelSelection(modelNames, "Select Debater 1", state.LastModel1);
+        var model2 = PromptModelSelection(modelNames, "Select Debater 2", state.LastModel2);
 
         // Persist selections for next run
         SaveState(new AppState { LastModel1 = model1, LastModel2 = model2 });
@@ -167,30 +254,32 @@ class Program
         Console.WriteLine();
 
         // ── Create chat instances ──────────────────────────────────────
-        var contextOptions = new RequestOptions { NumCtx = DefaultContextWindow };
+        IDebateChat chatA, chatB;
 
-        Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine($"  Context window: {DefaultContextWindow:N0} tokens per model");
-        Console.ResetColor();
-        Console.WriteLine();
-
-        var clientA = new OllamaApiClient(uri);
-        clientA.SelectedModel = model1;
-        var chatA = new Chat(clientA, BuildSystemPrompt(name1, model1, name2, model2, trumpMode))
+        if (openAiMode)
         {
-            Options = contextOptions
-        };
-
-        var clientB = new OllamaApiClient(uri);
-        clientB.SelectedModel = model2;
-        var chatB = new Chat(clientB, BuildSystemPrompt(name2, model2, name1, model1, trumpMode))
+            var oa = new OpenAIClient(new ApiKeyCredential(apiKey),
+                         new OpenAIClientOptions { Endpoint = uri });
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine("  Context window: controlled by the server (OpenAI mode)");
+            Console.ResetColor();
+            chatA = new OpenAIDebateChat(oa.GetChatClient(model1), BuildSystemPrompt(name1, model1, name2, model2, trumpMode));
+            chatB = new OpenAIDebateChat(oa.GetChatClient(model2), BuildSystemPrompt(name2, model2, name1, model1, trumpMode));
+        }
+        else
         {
-            Options = contextOptions
-        };
+            var opts = new RequestOptions { NumCtx = DefaultContextWindow };
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"  Context window: {DefaultContextWindow:N0} tokens per model");
+            Console.ResetColor();
+            var clientA = new OllamaApiClient(uri) { SelectedModel = model1 };
+            var clientB = new OllamaApiClient(uri) { SelectedModel = model2 };
+            chatA = new OllamaDebateChat(new Chat(clientA, BuildSystemPrompt(name1, model1, name2, model2, trumpMode)) { Options = opts });
+            chatB = new OllamaDebateChat(new Chat(clientB, BuildSystemPrompt(name2, model2, name1, model1, trumpMode)) { Options = opts });
+        }
 
-        // Conversation history is maintained client-side in the Chat.Messages
-        // list and sent in full with every API call. This means models can freely
-        // unload/reload between turns without losing any context.
+        // Conversation history is maintained client-side and sent in full with every API call.
+        // This means models can freely unload/reload between turns without losing any context.
         Console.ForegroundColor = ConsoleColor.DarkGray;
         Console.WriteLine("  Models will load/unload naturally between turns.");
         Console.WriteLine("  Full conversation history is sent with each request.");
@@ -521,7 +610,7 @@ class Program
     //  Streaming & Display
     // ════════════════════════════════════════════════════════════════════
 
-    static async Task<string> StreamResponse(Chat chat, string message, string modelName, ConsoleColor color)
+    static async Task<string> StreamResponse(IDebateChat chat, string message, string modelName, ConsoleColor color)
     {
         var sb = new StringBuilder();
         bool thinkingHeaderWritten = false;
@@ -650,8 +739,8 @@ class Program
     /// Both must [CONFIRM] for the consensus to be accepted.
     /// </summary>
     static async Task<(bool Verified, string ResponseA, string ResponseB)> VerifyConsensusAsync(
-        Chat chatA, string nameA, string positionA,
-        Chat chatB, string nameB, string positionB)
+        IDebateChat chatA, string nameA, string positionA,
+        IDebateChat chatB, string nameB, string positionB)
     {
         PrintVerifyingConsensus();
 
@@ -686,8 +775,8 @@ class Program
     /// Both models must STILL include [IMPASSE] for the impasse to hold.
     /// </summary>
     static async Task<(bool StillImpasse, string ResponseA, string ResponseB)> AttemptReconciliationAsync(
-        Chat chatA, string nameA,
-        Chat chatB, string nameB,
+        IDebateChat chatA, string nameA,
+        IDebateChat chatB, string nameB,
         string topic)
     {
         PrintReconciliationAttempt();
@@ -741,6 +830,12 @@ class Program
                 || msg.Contains("token limit", StringComparison.OrdinalIgnoreCase))
                 return true;
 
+            // OpenAI-compatible server error strings
+            if (msg.Contains("context_length_exceeded", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("maximum context length", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("reduce the length", StringComparison.OrdinalIgnoreCase))
+                return true;
+
             current = current.InnerException;
         }
         return false;
@@ -750,14 +845,14 @@ class Program
     //  UI Helpers
     // ════════════════════════════════════════════════════════════════════
 
-    static void PrintHistoryDepth(Chat chatA, string modelA, Chat chatB, string modelB)
+    static void PrintHistoryDepth(IDebateChat chatA, string modelA, IDebateChat chatB, string modelB)
     {
         Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine($"  [History] {modelA}: {chatA.Messages.Count} messages | {modelB}: {chatB.Messages.Count} messages");
+        Console.WriteLine($"  [History] {modelA}: {chatA.MessageCount} messages | {modelB}: {chatB.MessageCount} messages");
         Console.ResetColor();
     }
 
-    static string PromptModelSelection(IList<OllamaSharp.Models.Model> models, string label, string? defaultModel = null)
+    static string PromptModelSelection(IList<string> models, string label, string? defaultModel = null)
     {
         // Resolve default index (1-based) if the saved model still exists
         int? defaultIndex = null;
@@ -765,7 +860,7 @@ class Program
         {
             for (int i = 0; i < models.Count; i++)
             {
-                if (string.Equals(models[i].Name, defaultModel, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(models[i], defaultModel, StringComparison.OrdinalIgnoreCase))
                 {
                     defaultIndex = i + 1;
                     break;
@@ -787,7 +882,7 @@ class Program
             // Accept default on empty input
             if (string.IsNullOrEmpty(input) && defaultIndex.HasValue)
             {
-                var selected = models[defaultIndex.Value - 1].Name;
+                var selected = models[defaultIndex.Value - 1];
                 Console.ForegroundColor = ConsoleColor.DarkGray;
                 Console.WriteLine($"  -> {selected}");
                 Console.ResetColor();
@@ -797,7 +892,7 @@ class Program
             if (int.TryParse(input, out int choice)
                 && choice >= 1 && choice <= models.Count)
             {
-                var selected = models[choice - 1].Name;
+                var selected = models[choice - 1];
                 Console.ForegroundColor = ConsoleColor.DarkGray;
                 Console.WriteLine($"  -> {selected}");
                 Console.ResetColor();
