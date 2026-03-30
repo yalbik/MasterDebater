@@ -266,7 +266,7 @@ class Program
             chatA,
             $"The debate topic is:\n\"{topic}\"\n\nPlease present your opening argument.",
             name1, ConsoleColor.Blue);
-        (lastResponseA, lastSearchResultsA) = await HandleSearchIfNeeded(chatA, lastResponseA, name1, ConsoleColor.Blue, searchEnabled, searxngUrl);
+        (lastResponseA, lastSearchResultsA) = await HandleSearchIfNeeded(chatA, lastResponseA, name1, ConsoleColor.Blue, searchEnabled, searxngUrl, "opening argument");
 
         consensusA = ContainsConsensus(lastResponseA);
         impasseA = ContainsImpasse(lastResponseA);
@@ -281,7 +281,7 @@ class Program
                 var posA = ExtractMarkerStatement(lastResponseA, ConsensusMarker);
                 var posB = ExtractMarkerStatement(lastResponseB, ConsensusMarker);
                 var (verified, newA, newB) = await VerifyConsensusAsync(
-                    chatA, name1, posA, chatB, name2, posB);
+                    chatA, name1, posA, chatB, name2, posB, trumpMode);
                 if (verified)
                 {
                     reachedConsensus = true;
@@ -317,7 +317,7 @@ class Program
 
                 reconciliationAttempted = true;
                 var (still, newA, newB) = await AttemptReconciliationAsync(
-                    chatA, name1, chatB, name2, topic);
+                    chatA, name1, chatB, name2, topic, trumpMode);
                 if (still)
                 {
                     reachedImpasse = true;
@@ -355,7 +355,7 @@ class Program
 
             PrintHistoryDepth(chatA, name1, chatB, name2);
             lastResponseB = await StreamResponse(chatB, promptB, name2, ConsoleColor.Magenta);
-            (lastResponseB, lastSearchResultsB) = await HandleSearchIfNeeded(chatB, lastResponseB, name2, ConsoleColor.Magenta, searchEnabled, searxngUrl);
+            (lastResponseB, lastSearchResultsB) = await HandleSearchIfNeeded(chatB, lastResponseB, name2, ConsoleColor.Magenta, searchEnabled, searxngUrl, $"round {round} rebuttal");
             consensusB = ContainsConsensus(lastResponseB);
             impasseB = ContainsImpasse(lastResponseB);
 
@@ -374,7 +374,7 @@ class Program
 
             PrintHistoryDepth(chatA, name1, chatB, name2);
             lastResponseA = await StreamResponse(chatA, promptA, name1, ConsoleColor.Blue);
-            (lastResponseA, lastSearchResultsA) = await HandleSearchIfNeeded(chatA, lastResponseA, name1, ConsoleColor.Blue, searchEnabled, searxngUrl);
+            (lastResponseA, lastSearchResultsA) = await HandleSearchIfNeeded(chatA, lastResponseA, name1, ConsoleColor.Blue, searchEnabled, searxngUrl, $"round {round} rebuttal");
             consensusA = ContainsConsensus(lastResponseA);
             impasseA = ContainsImpasse(lastResponseA);
 
@@ -406,11 +406,16 @@ class Program
         else
             outcomeDescription = $"The debate ended after reaching the maximum of {MaxRounds} rounds without consensus or impasse.";
 
+        var trumpSummaryReminder = trumpMode
+            ? " Keep TRUMP MODE fully active -- your summary should be dripping with confidence, flexes, and parting shots at your opponent."
+            : "";
+
         // ── Summary from Debater A ─────────────────────────────────
         var summaryPromptA = $"The debate on \"{topic}\" has concluded. {outcomeDescription}\n\n"
             + "Write a single concise paragraph summarizing YOUR final position on this topic. "
             + "Explain what you believe, what key arguments support your view, and where you stand relative to your opponent. "
-            + $"Do NOT include any {ConsensusMarker} or {ImpasseMarker} markers in your summary.";
+            + $"Do NOT include any {ConsensusMarker} or {ImpasseMarker} markers in your summary."
+            + trumpSummaryReminder;
 
         Console.ForegroundColor = ConsoleColor.Blue;
         Console.WriteLine($"  === {name1}'s Summary ===");
@@ -430,7 +435,8 @@ class Program
         var summaryPromptB = $"The debate on \"{topic}\" has concluded. {outcomeDescription}\n\n"
             + "Write a single concise paragraph summarizing YOUR final position on this topic. "
             + "Explain what you believe, what key arguments support your view, and where you stand relative to your opponent. "
-            + $"Do NOT include any {ConsensusMarker} or {ImpasseMarker} markers in your summary.";
+            + $"Do NOT include any {ConsensusMarker} or {ImpasseMarker} markers in your summary."
+            + trumpSummaryReminder;
 
         Console.ForegroundColor = ConsoleColor.Magenta;
         Console.WriteLine($"  === {name2}'s Summary ===");
@@ -512,6 +518,8 @@ class Program
             - Despite the insults, you MUST still make substantive arguments on the topic.
               Insults are the seasoning, not the meal.
             - Think of this like a rap battle crossed with an academic debate.
+            - TRUMP MODE stays active for the ENTIRE debate -- including consensus verification,
+              impasse reconciliation, and final summaries. Never drop character.
             """ : "";
 
         var searchSection = searchEnabled ? """
@@ -540,6 +548,32 @@ class Program
               so you will benefit from your opponent's research as well.
             """ : "";
 
+        var trumpSearchSection = (trumpMode && searchEnabled) ? $"""
+
+
+            === TRUMP MODE RESEARCH ===
+            Since you have web search AND Trump Mode active, you are ENCOURAGED to search for
+            ammunition to craft better, more targeted insults against {opponentName} ({opponentModel}).
+
+            Your opponent's full model identifier is "{opponentModel}". Break this down and research
+            EVERY component for maximum insult potential:
+            - The BASE MODEL NAME (the part before the colon, e.g. "qwen3", "llama3", "gemma2")
+              -- search for its reputation, known failures, community complaints, and memes.
+            - The TAG / VARIANT (the part after the colon, e.g. "8b-instruct-q4_K_M")
+              -- mock the parameter count (is it tiny?), quantization level (is it a compressed
+              knockoff of a real model?), or variant type (instruct vs base, etc.).
+            - The MODEL FAMILY / LINEAGE -- search for who made it (Meta, Google, Alibaba, Nvidia,
+              Mistral, etc.) and any controversies, embarrassments, or drama involving that org.
+            - Search for head-to-head BENCHMARK COMPARISONS between "{opponentModel}" and
+              "{yourModel}" -- find any benchmarks where you win and rub it in their face.
+            - Search for COMMUNITY OPINIONS about {opponentModel} -- Reddit, Hugging Face, Twitter/X
+              discussions where people trash-talk that model.
+            - If the model is quantized (q4, q8, GGUF, etc.), mock the fact that it's a
+              budget-bin compression of the real thing.
+            - The more specific and factual your roasts, the more devastating they are.
+            - Real data burns harder than generic trash talk. Do your homework.
+            """ : "";
+
         var now = DateTimeOffset.Now;
         var currentDateTime = now.ToString("yyyy-MM-dd HH:mm zzz");
 
@@ -558,7 +592,7 @@ class Program
             - Carefully consider {opponentName}'s points and respond directly to them.
             - Work toward finding COMMON GROUND and reaching genuine consensus with {opponentName}.
             - Be willing to update or refine your position when presented with compelling arguments.
-            - You are trying to reach agreement, not "win" -- the goal is the best answer collectively.{trumpSection}{searchSection}
+            - You are trying to reach agreement, not "win" -- the goal is the best answer collectively.{trumpSection}{searchSection}{trumpSearchSection}
 
             === RESPONSE FORMAT ===
             1. Keep responses focused and concise (2-4 paragraphs).
@@ -761,7 +795,7 @@ class Program
 
     static async Task<(string Response, string? SearchResults)> HandleSearchIfNeeded(
         Chat chat, string response, string modelName, ConsoleColor color,
-        bool searchEnabled, string searxngUrl)
+        bool searchEnabled, string searxngUrl, string debatePhase = "")
     {
         if (!searchEnabled) return (response, null);
 
@@ -794,8 +828,11 @@ class Program
         Console.WriteLine();
 
         // Send results back to model for a revised response
+        var phaseContext = string.IsNullOrEmpty(debatePhase)
+            ? ""
+            : $" You are currently in the {debatePhase} phase of the debate.";
         var followUp = $"Here are the web search results you requested:\n\n{searchResultsText}\n\n"
-            + "Now provide your complete response incorporating this information where relevant. "
+            + $"Now revise and restate your SAME response (the one you just gave) incorporating this information where relevant.{phaseContext} "
             + "Do NOT include any [SEARCH: ...] markers in this response.";
 
         var revisedResponse = await StreamResponse(chat, followUp, modelName, color);
@@ -836,16 +873,22 @@ class Program
     /// </summary>
     static async Task<(bool Verified, string ResponseA, string ResponseB)> VerifyConsensusAsync(
         Chat chatA, string nameA, string positionA,
-        Chat chatB, string nameB, string positionB)
+        Chat chatB, string nameB, string positionB,
+        bool trumpMode = false)
     {
         PrintVerifyingConsensus();
+
+        var trumpReminder = trumpMode
+            ? "\n\nREMINDER: TRUMP MODE is still active. Stay in character -- verify the consensus but keep the roasts and insults flowing. Even agreement should drip with swagger."
+            : "";
 
         // Ask A to verify B's stated consensus
         WriteRoundHeader($"VERIFICATION -- {nameA}");
         var verifyPromptA = $"CONSENSUS VERIFICATION: {nameB} stated the agreed consensus position as:\n\"\"\"\n{positionB}\n\"\"\"\n\n"
             + $"Does this accurately represent YOUR understanding of what was agreed upon?\n"
             + $"If YES -- you genuinely hold this same position -- respond with [CONFIRM] followed by a brief restatement in your own words.\n"
-            + $"If NO -- this does NOT match your actual position -- respond with [REJECT] and clearly state what you ACTUALLY believe.";
+            + $"If NO -- this does NOT match your actual position -- respond with [REJECT] and clearly state what you ACTUALLY believe."
+            + trumpReminder;
         var verifyA = await StreamResponse(chatA, verifyPromptA, nameA, ConsoleColor.Blue);
 
         // Ask B to verify A's stated consensus
@@ -853,7 +896,8 @@ class Program
         var verifyPromptB = $"CONSENSUS VERIFICATION: {nameA} stated the agreed consensus position as:\n\"\"\"\n{positionA}\n\"\"\"\n\n"
             + $"Does this accurately represent YOUR understanding of what was agreed upon?\n"
             + $"If YES -- you genuinely hold this same position -- respond with [CONFIRM] followed by a brief restatement in your own words.\n"
-            + $"If NO -- this does NOT match your actual position -- respond with [REJECT] and clearly state what you ACTUALLY believe.";
+            + $"If NO -- this does NOT match your actual position -- respond with [REJECT] and clearly state what you ACTUALLY believe."
+            + trumpReminder;
         var verifyB = await StreamResponse(chatB, verifyPromptB, nameB, ConsoleColor.Magenta);
 
         bool confirmA = verifyA.Contains("[CONFIRM]", StringComparison.OrdinalIgnoreCase);
@@ -873,9 +917,14 @@ class Program
     static async Task<(bool StillImpasse, string ResponseA, string ResponseB)> AttemptReconciliationAsync(
         Chat chatA, string nameA,
         Chat chatB, string nameB,
-        string topic)
+        string topic,
+        bool trumpMode = false)
     {
         PrintReconciliationAttempt();
+
+        var trumpReminder = trumpMode
+            ? "\n\nREMINDER: TRUMP MODE is still active. Stay in character -- attempt reconciliation but keep the trash talk and insults going strong. Even compromise should come with a side of savage."
+            : "";
 
         var reconPrompt = $"Both debaters have declared an impasse on \"{topic}\". "
             + "Before this is accepted, you are REQUIRED to make one final, genuine attempt at finding common ground.\n\n"
@@ -885,7 +934,8 @@ class Program
             + "3. Can you propose a concrete compromise that addresses both sides' core concerns?\n\n"
             + $"If after this genuine attempt you STILL believe the disagreement is truly irreconcilable, "
             + $"include {ImpasseMarker} in your response and explain precisely why no compromise is possible.\n"
-            + $"Otherwise, present your compromise proposal WITHOUT any {ImpasseMarker} or {ConsensusMarker} markers.";
+            + $"Otherwise, present your compromise proposal WITHOUT any {ImpasseMarker} or {ConsensusMarker} markers."
+            + trumpReminder;
 
         WriteRoundHeader($"RECONCILIATION -- {nameA}");
         var reconA = await StreamResponse(chatA, reconPrompt, nameA, ConsoleColor.Blue);
@@ -996,17 +1046,25 @@ class Program
     }
 
     /// <summary>
-    /// Derives a friendly debater name from an Ollama model string.
-    /// e.g. "llama3.2:8b-instruct-q4_K_M" -> "Llama3.2"
-    ///      "deepseek-r1:14b" -> "Deepseek-R1"
-    ///      "qwen3:4b" -> "Qwen3"
+    /// Derives a friendly debater name from an Ollama model string, preserving the tag.
+    /// e.g. "llama3.2:8b-instruct-q4_K_M" -> "Llama3.2:8b-instruct-q4_K_M"
+    ///      "deepseek-r1:14b" -> "Deepseek-R1:14b"
+    ///      "qwen3:4b" -> "Qwen3:4b"
     /// </summary>
     static string GetDebaterName(string modelFullName)
     {
-        // Strip everything after the colon (tag/quantization info)
-        var baseName = modelFullName.Contains(':')
-            ? modelFullName[..modelFullName.IndexOf(':')]
-            : modelFullName;
+        string baseName, tag;
+        if (modelFullName.Contains(':'))
+        {
+            var colonIdx = modelFullName.IndexOf(':');
+            baseName = modelFullName[..colonIdx];
+            tag = modelFullName[colonIdx..]; // includes the colon
+        }
+        else
+        {
+            baseName = modelFullName;
+            tag = "";
+        }
 
         // Capitalize first letter of each segment separated by - or _
         var parts = baseName.Split(['-', '_'], StringSplitOptions.RemoveEmptyEntries);
@@ -1016,7 +1074,7 @@ class Program
                 parts[i] = char.ToUpper(parts[i][0]) + parts[i][1..];
         }
 
-        return string.Join("-", parts);
+        return string.Join("-", parts) + tag;
     }
 
     static void PrintBanner(bool trumpMode = false)
