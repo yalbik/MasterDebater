@@ -690,10 +690,14 @@ class Program
             Console.ResetColor();
         }
 
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        int tokenCount = 0;
+
         try
         {
             await foreach (var token in chat.SendAsync(message))
             {
+                tokenCount++;
                 if (isThinking && !responseHeaderWritten)
                 {
                     // Transition from thinking to actual response
@@ -736,11 +740,17 @@ class Program
             chat.OnThink -= OnThink;
         }
 
+        stopwatch.Stop();
+        var elapsed = stopwatch.Elapsed;
+        var tokensPerSec = elapsed.TotalSeconds > 0 ? tokenCount / elapsed.TotalSeconds : 0;
+
         lock (ConsoleLock)
         {
             Console.WriteLine();
             Console.ForegroundColor = color;
             Console.WriteLine("  +-------------------------------------------------------");
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"  [{tokenCount} tokens in {elapsed.TotalSeconds:F1}s — {tokensPerSec:F1} tok/s]");
             Console.ResetColor();
         }
 
