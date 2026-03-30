@@ -1,5 +1,6 @@
 ﻿using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using OllamaSharp;
 using OllamaSharp.Models;
 using OllamaSharp.Models.Chat;
@@ -25,6 +26,7 @@ class Program
     private const string ImpasseMarker = "[IMPASSE]";
     private const int MinRoundsForImpasse = 3;
     private static readonly object ConsoleLock = new();
+    private static readonly HttpClient SearxHttpClient = new() { Timeout = TimeSpan.FromSeconds(10) };
     private static readonly string StateFilePath = Path.Combine(
         ".", "state.json");
 
@@ -70,8 +72,23 @@ class Program
 
         // ── Parse command-line flags ───────────────────────────────────
         bool trumpMode = args.Any(a => a.Equals("--trump", StringComparison.OrdinalIgnoreCase));
-        // Remove flags so positional args (like URL) still work
-        var positionalArgs = args.Where(a => !a.StartsWith("--")).ToArray();
+        bool noSearch = args.Any(a => a.Equals("--no-search", StringComparison.OrdinalIgnoreCase));
+        string searxngUrl = "http://localhost:8411";
+
+        // Extract --searxng-url value and collect positional args
+        var positionalArgsList = new List<string>();
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i].Equals("--searxng-url", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+            {
+                searxngUrl = args[++i];
+            }
+            else if (!args[i].StartsWith("--"))
+            {
+                positionalArgsList.Add(args[i]);
+            }
+        }
+        var positionalArgs = positionalArgsList.ToArray();
 
         PrintBanner(trumpMode);
 
@@ -107,6 +124,31 @@ class Program
             WriteError("Install more models with: ollama pull <model-name>");
             return;
         }
+
+        // ── Check SearXNG availability ─────────────────────────────────
+        bool searchEnabled = false;
+        if (!noSearch)
+        {
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                using var testResponse = await SearxHttpClient.GetAsync(searxngUrl, cts.Token);
+                if (testResponse.IsSuccessStatusCode)
+                {
+                    searchEnabled = true;
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"  SearXNG available at {searxngUrl} (web search enabled)");
+                    Console.ResetColor();
+                }
+            }
+            catch
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"  SearXNG not available at {searxngUrl} (web search disabled)");
+                Console.ResetColor();
+            }
+        }
+        Console.WriteLine();
 
         // ── Get debate topic ───────────────────────────────────────────
         Console.ForegroundColor = ConsoleColor.Yellow;
@@ -163,6 +205,10 @@ class Program
         {
             Console.Write("  Mode:      "); Console.ForegroundColor = ConsoleColor.Red; Console.WriteLine("TRUMP MODE \U0001f525 -- Insults enabled!"); Console.ResetColor();
         }
+        Console.Write("  Search:    ");
+        if (searchEnabled) { Console.ForegroundColor = ConsoleColor.Green; Console.WriteLine($"Enabled ({searxngUrl})"); }
+        else { Console.ForegroundColor = ConsoleColor.DarkGray; Console.WriteLine("Disabled"); }
+        Console.ResetColor();
         WriteDivider('=');
         Console.WriteLine();
 
@@ -176,14 +222,14 @@ class Program
 
         var clientA = new OllamaApiClient(uri);
         clientA.SelectedModel = model1;
-        var chatA = new Chat(clientA, BuildSystemPrompt(name1, model1, name2, model2, trumpMode))
+        var chatA = new Chat(clientA, BuildSystemPrompt(name1, model1, name2, model2, trumpMode, searchEnabled))
         {
             Options = contextOptions
         };
 
         var clientB = new OllamaApiClient(uri);
         clientB.SelectedModel = model2;
-        var chatB = new Chat(clientB, BuildSystemPrompt(name2, model2, name1, model1, trumpMode))
+        var chatB = new Chat(clientB, BuildSystemPrompt(name2, model2, name1, model1, trumpMode, searchEnabled))
         {
             Options = contextOptions
         };
@@ -200,6 +246,8 @@ class Program
         // ── Run the debate ─────────────────────────────────────────────
         string lastResponseA = string.Empty;
         string lastResponseB = string.Empty;
+        string? lastSearchResultsA = null;
+        string? lastSearchResultsB = null;
         bool consensusA = false;
         bool consensusB = false;
         bool impasseA = false;
@@ -218,6 +266,7 @@ class Program
             chatA,
             $"The debate topic is:\n\"{topic}\"\n\nPlease present your opening argument.",
             name1, ConsoleColor.Blue);
+        (lastResponseA, lastSearchResultsA) = await HandleSearchIfNeeded(chatA, lastResponseA, name1, ConsoleColor.Blue, searchEnabled, searxngUrl);
 
         consensusA = ContainsConsensus(lastResponseA);
         impasseA = ContainsImpasse(lastResponseA);
@@ -294,12 +343,19 @@ class Program
             // ── Debater B responds ─────────────────────────────────────
             WriteRoundHeader($"ROUND {round} -- {name2} responds");
 
+            string searchContext = "";
+            if (lastSearchResultsA != null)
+            {
+                searchContext = $"\n\n[Research from {name1}'s web searches -- use these results to inform your response]\n{lastSearchResultsA}";
+            }
+
             string promptB = round == 1
-                ? $"The debate topic is:\n\"{topic}\"\n\nYour opponent {name1} opened with:\n\n\"\"\"\n{lastResponseA}\n\"\"\"\n\nPresent your response and counter-arguments."
-                : $"{name1} says:\n\n\"\"\"\n{lastResponseA}\n\"\"\"\n\nRespond to their arguments.";
+                ? $"The debate topic is:\n\"{topic}\"\n\nYour opponent {name1} opened with:\n\n\"\"\"\n{lastResponseA}\n\"\"\"\n\nPresent your response and counter-arguments.{searchContext}"
+                : $"{name1} says:\n\n\"\"\"\n{lastResponseA}\n\"\"\"\n\nRespond to their arguments.{searchContext}";
 
             PrintHistoryDepth(chatA, name1, chatB, name2);
             lastResponseB = await StreamResponse(chatB, promptB, name2, ConsoleColor.Magenta);
+            (lastResponseB, lastSearchResultsB) = await HandleSearchIfNeeded(chatB, lastResponseB, name2, ConsoleColor.Magenta, searchEnabled, searxngUrl);
             consensusB = ContainsConsensus(lastResponseB);
             impasseB = ContainsImpasse(lastResponseB);
 
@@ -308,10 +364,17 @@ class Program
             // ── Debater A responds ─────────────────────────────────────
             WriteRoundHeader($"ROUND {round} -- {name1} responds");
 
-            string promptA = $"{name2} says:\n\n\"\"\"\n{lastResponseB}\n\"\"\"\n\nRespond to their arguments.";
+            searchContext = "";
+            if (lastSearchResultsB != null)
+            {
+                searchContext = $"\n\n[Research from {name2}'s web searches -- use these results to inform your response]\n{lastSearchResultsB}";
+            }
+
+            string promptA = $"{name2} says:\n\n\"\"\"\n{lastResponseB}\n\"\"\"\n\nRespond to their arguments.{searchContext}";
 
             PrintHistoryDepth(chatA, name1, chatB, name2);
             lastResponseA = await StreamResponse(chatA, promptA, name1, ConsoleColor.Blue);
+            (lastResponseA, lastSearchResultsA) = await HandleSearchIfNeeded(chatA, lastResponseA, name1, ConsoleColor.Blue, searchEnabled, searxngUrl);
             consensusA = ContainsConsensus(lastResponseA);
             impasseA = ContainsImpasse(lastResponseA);
 
@@ -425,7 +488,7 @@ class Program
     //  System Prompt Builder
     // ════════════════════════════════════════════════════════════════════
 
-    static string BuildSystemPrompt(string yourName, string yourModel, string opponentName, string opponentModel, bool trumpMode = false)
+    static string BuildSystemPrompt(string yourName, string yourModel, string opponentName, string opponentModel, bool trumpMode = false, bool searchEnabled = false)
     {
         var trumpSection = trumpMode ? $"""
 
@@ -451,18 +514,51 @@ class Program
             - Think of this like a rap battle crossed with an academic debate.
             """ : "";
 
+        var searchSection = searchEnabled ? """
+
+
+            === WEB SEARCH ===
+            You have access to a web search tool (SearXNG). To look something up, include the
+            following marker anywhere in your response:
+
+                [SEARCH: your search query here]
+
+            You may include multiple [SEARCH: ...] markers for different queries. The searches will
+            be performed automatically and results provided to you so you can incorporate them into
+            a revised response.
+
+            GUIDELINES:
+            - You are STRONGLY ENCOURAGED to search liberally. The performance cost is minimal.
+            - Search whenever you are not entirely sure about a fact, statistic, date, or claim.
+            - Search when you want more information, deeper context, or stronger evidence for your arguments.
+            - Search to fact-check claims made by your opponent.
+            - Search for recent events, current data, or anything beyond your training cutoff.
+            - Multiple searches per response are perfectly fine -- cast a wide net.
+            - Keep search queries concise and specific for best results.
+            - When in doubt, SEARCH. It is better to verify than to guess.
+            - Any search results obtained (by you OR your opponent) will be shared with both debaters,
+              so you will benefit from your opponent's research as well.
+            """ : "";
+
+        var now = DateTimeOffset.Now;
+        var currentDateTime = now.ToString("yyyy-MM-dd HH:mm zzz");
+
         return $"""
             You are "{yourName}" in a structured AI debate.
             Your name is "{yourName}" and you are running model "{yourModel}".
             Your opponent's name is "{opponentName}" and they are running model "{opponentModel}".
             Always refer to yourself as "{yourName}" and your opponent as "{opponentName}".
 
+            The current date and time is {currentDateTime}. Use this as your reference for
+            "today", "recent", "current year", etc. Your training data may be outdated --
+            always rely on this date rather than your training cutoff for temporal context.
+
             === YOUR OBJECTIVE ===
             - Present clear, well-reasoned arguments on the given debate topic.
             - Carefully consider {opponentName}'s points and respond directly to them.
             - Work toward finding COMMON GROUND and reaching genuine consensus with {opponentName}.
             - Be willing to update or refine your position when presented with compelling arguments.
-            - You are trying to reach agreement, not "win" -- the goal is the best answer collectively.{trumpSection}
+            - You are trying to reach agreement, not "win" -- the goal is the best answer collectively.{trumpSection}{searchSection}
 
             === RESPONSE FORMAT ===
             1. Keep responses focused and concise (2-4 paragraphs).
@@ -615,6 +711,95 @@ class Program
         }
 
         return sb.ToString();
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  SearXNG Web Search
+    // ════════════════════════════════════════════════════════════════════
+
+    static List<string> ExtractSearchQueries(string response)
+    {
+        var matches = Regex.Matches(response, @"\[SEARCH:\s*(.+?)\]", RegexOptions.IgnoreCase);
+        return matches.Select(m => m.Groups[1].Value.Trim()).ToList();
+    }
+
+    static async Task<string> SearchSearXNG(string query, string searxngUrl)
+    {
+        try
+        {
+            var url = $"{searxngUrl.TrimEnd('/')}/search?q={Uri.EscapeDataString(query)}&format=json";
+            using var response = await SearxHttpClient.GetAsync(url);
+            response.EnsureSuccessStatusCode();
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+
+            if (!doc.RootElement.TryGetProperty("results", out var results))
+                return "  (No results found)";
+
+            var sb = new StringBuilder();
+            int count = 0;
+            foreach (var result in results.EnumerateArray())
+            {
+                if (count >= 5) break;
+                var title = result.TryGetProperty("title", out var t) ? t.GetString() : "";
+                var resultUrl = result.TryGetProperty("url", out var u) ? u.GetString() : "";
+                var content = result.TryGetProperty("content", out var c) ? c.GetString() : "";
+                sb.AppendLine($"  [{count + 1}] {title}");
+                sb.AppendLine($"      {resultUrl}");
+                if (!string.IsNullOrWhiteSpace(content))
+                    sb.AppendLine($"      {content}");
+                sb.AppendLine();
+                count++;
+            }
+            return count > 0 ? sb.ToString() : "  (No results found)";
+        }
+        catch (Exception ex)
+        {
+            return $"  (Search failed: {ex.Message})";
+        }
+    }
+
+    static async Task<(string Response, string? SearchResults)> HandleSearchIfNeeded(
+        Chat chat, string response, string modelName, ConsoleColor color,
+        bool searchEnabled, string searxngUrl)
+    {
+        if (!searchEnabled) return (response, null);
+
+        var queries = ExtractSearchQueries(response);
+        if (queries.Count == 0) return (response, null);
+
+        // Display search activity
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.DarkYellow;
+        foreach (var query in queries)
+        {
+            Console.WriteLine($"  [SearXNG] Searching: \"{query}\" ...");
+        }
+        Console.ResetColor();
+
+        // Perform all searches
+        var allResults = new StringBuilder();
+        foreach (var query in queries)
+        {
+            var results = await SearchSearXNG(query, searxngUrl);
+            allResults.AppendLine($"Results for \"{query}\":");
+            allResults.AppendLine(results);
+        }
+
+        var searchResultsText = allResults.ToString();
+
+        Console.ForegroundColor = ConsoleColor.DarkYellow;
+        Console.WriteLine("  [SearXNG] Search complete. Model is incorporating results...");
+        Console.ResetColor();
+        Console.WriteLine();
+
+        // Send results back to model for a revised response
+        var followUp = $"Here are the web search results you requested:\n\n{searchResultsText}\n\n"
+            + "Now provide your complete response incorporating this information where relevant. "
+            + "Do NOT include any [SEARCH: ...] markers in this response.";
+
+        var revisedResponse = await StreamResponse(chat, followUp, modelName, color);
+        return (revisedResponse, searchResultsText);
     }
 
     // ════════════════════════════════════════════════════════════════════
